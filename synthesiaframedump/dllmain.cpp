@@ -11,7 +11,7 @@ extern "C" __declspec(dllexport) void dummyexport() {}
 
 // gl constants defined here so i don't have to require glfw
 #define GL_VIEWPORT 0x0BA2
-#define GL_RGBA 0x1908
+#define GL_BGRA 0x80E1
 #define GL_UNSIGNED_BYTE 0x1401
 
 // offsets for synthesia 10.1.3320, can easily be adjusted
@@ -19,6 +19,7 @@ extern "C" __declspec(dllexport) void dummyexport() {}
 #define GLSWAP_PTR 0x539938
 #define HDC_OFFSET 0x2C
 #define GAMESTATE_CTOR_PTR 0x18A2B0
+#define PLAYINGSTATE_CTOR_PTR 0x18B110
 
 HANDLE video_pipe = NULL;
 int gl_viewport[4];
@@ -37,6 +38,9 @@ __int64 fake_qpc_interval;
 
 C_Hook hook_gamestate_ctor;
 auto gamestate_ctor = (void(__thiscall*)(void*, DWORD*))nullptr;
+
+C_Hook hook_playingstate_ctor;
+auto playingstate_ctor = (void(__thiscall*)(void*))nullptr;
 
 auto glFlush = (void(__stdcall*)())nullptr;
 auto glGetIntegerv = (void(__stdcall*)(DWORD, int*))nullptr;
@@ -98,7 +102,7 @@ BOOL __fastcall custom_glswap(char* thisptr, void*) {
     glFlush();
 
     if (ingame) {
-        glReadPixels(0, 0, vp_width, vp_height, GL_RGBA, GL_UNSIGNED_BYTE, fb_data);
+        glReadPixels(0, 0, vp_width, vp_height, GL_BGRA, GL_UNSIGNED_BYTE, fb_data);
         WriteFile(video_pipe, fb_data, static_cast<DWORD>(vp_width * vp_height * 4), nullptr, nullptr);
     }
 
@@ -113,6 +117,15 @@ void __fastcall custom_gamestate_ctor(void* thisptr, void*, DWORD* unk) {
     ingame = true;
 
     gamestate_ctor(thisptr, unk);
+}
+
+void __fastcall custom_playingstate_ctor(void* thisptr, void*) {
+    hook_playingstate_ctor.removeHook();
+
+    printf("stopping\n");
+    ingame = false;
+
+    playingstate_ctor(thisptr);
 }
 
 BOOL APIENTRY DllMain( HMODULE hModule,
@@ -186,6 +199,10 @@ BOOL APIENTRY DllMain( HMODULE hModule,
         printf("hooking GameState's constructor\n");
         gamestate_ctor = (void(__thiscall*)(void*, DWORD*))(base_addr + GAMESTATE_CTOR_PTR);
         MAKE_HOOK(gamestate_ctor);
+
+        printf("hooking PlayingState's constructor\n");
+        playingstate_ctor = (void(__thiscall*)(void*))(base_addr + PLAYINGSTATE_CTOR_PTR);
+        MAKE_HOOK(playingstate_ctor);
 
         break;
     }
