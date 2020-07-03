@@ -20,6 +20,7 @@ extern "C" __declspec(dllexport) void dummyexport() {}
 #define HDC_OFFSET 0x2C
 #define GAMESTATE_CTOR_PTR 0x18A2B0
 #define PLAYINGSTATE_CTOR_PTR 0x18B110
+#define QPC_CALL 0x1FBAB8
 
 HANDLE video_pipe = NULL;
 int gl_viewport[4];
@@ -28,6 +29,8 @@ int vp_height;
 
 bool resolution_shown = false;
 bool ingame = false;
+
+char* base_addr = nullptr;
 
 void* fb_data = nullptr;
 
@@ -45,6 +48,7 @@ auto playingstate_ctor = (void(__thiscall*)(void*))nullptr;
 auto glFlush = (void(__stdcall*)())nullptr;
 auto glGetIntegerv = (void(__stdcall*)(DWORD, int*))nullptr;
 auto glReadPixels = (void(__stdcall*)(int, int, DWORD, DWORD, DWORD, DWORD, void*))nullptr;
+auto _wglGetProcAddress = (PROC(WINAPI*)(LPCSTR))nullptr;
 
 void fail() {
     printf("exiting in 5 seconds...\n");
@@ -60,10 +64,11 @@ BOOL __stdcall custom_qpc(LARGE_INTEGER* out) {
         return false;
     out->QuadPart = qpc_ret.QuadPart / 2;
     */
-    fake_qpc.QuadPart += fake_qpc_interval;
     *out = fake_qpc;
     return true;
 }
+
+static auto custom_qpc_ptr = &custom_qpc;
 
 // supposed to be __thiscall, but i have to use this hacky workaround
 BOOL __fastcall custom_glswap(char* thisptr, void*) {
@@ -72,6 +77,12 @@ BOOL __fastcall custom_glswap(char* thisptr, void*) {
     if (!resolution_shown) {
         // all of this has to be in this function because getting the viewport during normal init won't work
         // something to do with being in the middle of glBegin
+        /*
+        printf("disabling vsync\n");
+        auto wglSwapIntervalEXT = (BOOL(WINAPI*)(int))_wglGetProcAddress("wglSwapIntervalEXT");
+        wglSwapIntervalEXT(0);
+        */
+
         glGetIntegerv(GL_VIEWPORT, gl_viewport);
         vp_width = gl_viewport[2];
         vp_height = gl_viewport[3];
@@ -161,24 +172,23 @@ BOOL APIENTRY DllMain( HMODULE hModule,
             printf("failed to get the performance counter frequency! getlasterror: 0x%x\n", GetLastError());
             fail();
         }
-        //fake_qpc_interval = pf.QuadPart / 60;
-        fake_qpc_interval = 20;
-        //printf("%lld\n", fake_qpc_interval);
-
-        // i don't want to flush instruction cache by patching stuff extremely often so this won't unhook on call
-        printf("hooking QueryPerformanceCounter\n");
-        auto qpc = ((BOOL(__stdcall*)(LARGE_INTEGER*))GetProcAddress(GetModuleHandle(L"kernel32.dll"), "QueryPerformanceCounter"));
-        MAKE_HOOK(qpc);
-        rtl_qpc = ((BOOL(__stdcall*)(LARGE_INTEGER*))GetProcAddress(GetModuleHandle(L"ntdll.dll"), "RtlQueryPerformanceCounter"));
+        fake_qpc_interval = pf.QuadPart / 100; // 100 fps, 60 fps will cause a slight desync between video and audio after a while
 
         // synthesia has aslr on
         printf("getting synthesia's base address\n");
-        char* base_addr = (char*)GetModuleHandle(NULL);
+        base_addr = (char*)GetModuleHandle(NULL);
         if (!base_addr) {
             printf("failed to get the base address! getlasterror: 0x%x\n", GetLastError());
             fail();
         }
         printf("base_addr: 0x%p\n", base_addr);
+
+        printf("replacing QueryPerformanceCounter call\n");
+        BYTE qpc_patch_bytes[] = { 0xFF, 0x15, 0x00, 0x00, 0x00, 0x00 };
+        auto custom_qpc_ptr_ptr = &custom_qpc_ptr;
+        memcpy(&qpc_patch_bytes[2], &custom_qpc_ptr_ptr, 4);
+        auto qpc_patch = QPatch((void*)(base_addr + QPC_CALL), (BYTE*)&qpc_patch_bytes, sizeof(qpc_patch_bytes));
+        qpc_patch.patch();
 
         printf("getting opengl functions\n");
         auto ogl32_handle = GetModuleHandle(L"opengl32.dll");
@@ -190,6 +200,7 @@ BOOL APIENTRY DllMain( HMODULE hModule,
         glFlush = (void(__stdcall*)())GetProcAddress(ogl32_handle, "glFlush");
         glGetIntegerv = (void(__stdcall*)(DWORD, int*))GetProcAddress(ogl32_handle, "glGetIntegerv");
         glReadPixels = (void(__stdcall*)(int, int, DWORD, DWORD, DWORD, DWORD, void*))GetProcAddress(ogl32_handle, "glReadPixels");
+        _wglGetProcAddress = (PROC(WINAPI*)(LPCSTR))GetProcAddress(ogl32_handle, "wglGetProcAddress");
 
         printf("overwriting RendererOpenGl vtable entry\n");
         auto custom_glswap_ptr = custom_glswap;
