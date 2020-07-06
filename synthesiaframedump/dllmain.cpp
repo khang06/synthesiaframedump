@@ -21,6 +21,7 @@ extern "C" __declspec(dllexport) void dummyexport() {}
 #define GAMESTATE_CTOR_PTR 0x18A2B0
 #define PLAYINGSTATE_CTOR_PTR 0x18B110
 #define QPC_CALL 0x1FBAB8
+#define QPF_CALL 0x1FBAAD
 
 HANDLE video_pipe = NULL;
 int gl_viewport[4];
@@ -70,9 +71,18 @@ BOOL __stdcall custom_qpc(LARGE_INTEGER* out) {
 
 static auto custom_qpc_ptr = &custom_qpc;
 
+BOOL __stdcall custom_qpf(LARGE_INTEGER* out) {
+    LARGE_INTEGER ret;
+    ret.QuadPart = 60;
+    *out = ret;
+    return true;
+}
+
+static auto custom_qpf_ptr = &custom_qpf;
+
 // supposed to be __thiscall, but i have to use this hacky workaround
 BOOL __fastcall custom_glswap(char* thisptr, void*) {
-    fake_qpc.QuadPart += fake_qpc_interval;
+    fake_qpc.QuadPart += 1;
 
     if (!resolution_shown) {
         // all of this has to be in this function because getting the viewport during normal init won't work
@@ -165,6 +175,7 @@ BOOL APIENTRY DllMain( HMODULE hModule,
             fail();
         }
 
+        /*
         printf("getting performance counter frequency\n");
         LARGE_INTEGER pf;
         bool qpf_ret = QueryPerformanceFrequency(&pf);
@@ -173,6 +184,7 @@ BOOL APIENTRY DllMain( HMODULE hModule,
             fail();
         }
         fake_qpc_interval = pf.QuadPart / 100; // 100 fps, 60 fps will cause a slight desync between video and audio after a while
+        */
 
         // synthesia has aslr on
         printf("getting synthesia's base address\n");
@@ -189,6 +201,14 @@ BOOL APIENTRY DllMain( HMODULE hModule,
         memcpy(&qpc_patch_bytes[2], &custom_qpc_ptr_ptr, 4);
         auto qpc_patch = QPatch((void*)(base_addr + QPC_CALL), (BYTE*)&qpc_patch_bytes, sizeof(qpc_patch_bytes));
         qpc_patch.patch();
+
+        // could reuse qpc_patch_bytes but that's less readable
+        BYTE qpf_patch_bytes[] = { 0xFF, 0x15, 0x00, 0x00, 0x00, 0x00 };
+        printf("replacing QueryPerformanceFrequency call\n");
+        auto custom_qpf_ptr_ptr = &custom_qpf_ptr;
+        memcpy(&qpf_patch_bytes[2], &custom_qpf_ptr_ptr, 4);
+        auto qpf_patch = QPatch((void*)(base_addr + QPF_CALL), (BYTE*)&qpf_patch_bytes, sizeof(qpf_patch_bytes));
+        qpf_patch.patch();
 
         printf("getting opengl functions\n");
         auto ogl32_handle = GetModuleHandle(L"opengl32.dll");
