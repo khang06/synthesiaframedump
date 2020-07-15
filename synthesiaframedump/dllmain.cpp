@@ -9,19 +9,36 @@ extern "C" __declspec(dllexport) void dummyexport() {}
 #define MAKE_HOOK_HIDDEN1(x) hook_##x
 #define MAKE_HOOK_HIDDEN2(x) custom_##x
 
+#define SYNTHESIA_VER_MAJ 9
+#define SYNTHESIA_VER_MIN 0
+
 // gl constants defined here so i don't have to require glfw
 #define GL_VIEWPORT 0x0BA2
 #define GL_BGRA 0x80E1
 #define GL_UNSIGNED_BYTE 0x1401
 
-// offsets for synthesia 10.1.3320, can easily be adjusted
+// offsets for synthesia's executable, can easily be adjusted
 // relative to base address
+#if SYNTHESIA_VER_MAJ == 10 && SYNTHESIA_VER_MIN == 1
+// 10.1.3320
+#define USE_QPC
 #define GLSWAP_PTR 0x539938
 #define HDC_OFFSET 0x2C
 #define GAMESTATE_CTOR_PTR 0x18A2B0
 #define PLAYINGSTATE_CTOR_PTR 0x18B110
 #define QPC_CALL 0x1FBAB8
 #define QPF_CALL 0x1FBAAD
+#elif SYNTHESIA_VER_MAJ == 9 && SYNTHESIA_VER_MIN == 0
+// 9.0.2495
+#define STDCALL_GAMESTATE_CTOR
+#define GLSWAP_PTR 0x4E83E0
+#define HDC_OFFSET 0x34
+#define GAMESTATE_CTOR_PTR 0x1053A0
+#define PLAYINGSTATE_CTOR_PTR 0x105BA0
+#define TGT_CALL 0x1B2334 // older synthesia uses timeGetTime instead of QueryPerformanceCounter
+#elif
+#error invalid version!
+#endif
 
 HANDLE video_pipe = NULL;
 int gl_viewport[4];
@@ -35,13 +52,19 @@ char* base_addr = nullptr;
 
 void* fb_data = nullptr;
 
-C_Hook hook_qpc;
-auto rtl_qpc = (BOOL(__stdcall*)(LARGE_INTEGER*))nullptr;
+#ifdef USE_QPC
 LARGE_INTEGER fake_qpc;
 __int64 fake_qpc_interval;
+#else
+DWORD fake_tgt;
+#endif
 
 C_Hook hook_gamestate_ctor;
+#ifdef STDCALL_GAMESTATE_CTOR
+auto gamestate_ctor = (void(__stdcall*)(void*, void*))nullptr;
+#else
 auto gamestate_ctor = (void(__thiscall*)(void*, DWORD*))nullptr;
+#endif
 
 C_Hook hook_playingstate_ctor;
 auto playingstate_ctor = (void(__thiscall*)(void*))nullptr;
@@ -57,6 +80,7 @@ void fail() {
     exit(1);
 }
 
+#ifdef USE_QPC
 BOOL __stdcall custom_qpc(LARGE_INTEGER* out) {
     /*
     LARGE_INTEGER qpc_ret;
@@ -79,10 +103,21 @@ BOOL __stdcall custom_qpf(LARGE_INTEGER* out) {
 }
 
 static auto custom_qpf_ptr = &custom_qpf;
+#else
+DWORD __stdcall custom_tgt() {
+    return fake_tgt;
+}
+
+static auto custom_tgt_ptr = &custom_tgt;
+#endif
 
 // supposed to be __thiscall, but i have to use this hacky workaround
 BOOL __fastcall custom_glswap(char* thisptr, void*) {
+#ifdef USE_QPC
     fake_qpc.QuadPart += 1;
+#else
+    fake_tgt += 16; // 62.5 fps
+#endif
 
     if (!resolution_shown) {
         // all of this has to be in this function because getting the viewport during normal init won't work
@@ -131,12 +166,15 @@ BOOL __fastcall custom_glswap(char* thisptr, void*) {
 }
 
 // same applies here
+#ifdef STDCALL_GAMESTATE_CTOR
+void __stdcall custom_gamestate_ctor(void* thisptr, void* unk) {
+#else
 void __fastcall custom_gamestate_ctor(void* thisptr, void*, DWORD* unk) {
+#endif
     hook_gamestate_ctor.removeHook();
     
     printf("going ingame\n");
     ingame = true;
-
     gamestate_ctor(thisptr, unk);
 }
 
@@ -162,29 +200,22 @@ BOOL APIENTRY DllMain( HMODULE hModule,
         freopen("CONOUT$", "w", stdout);
         SetConsoleTitle(L"synthesiaframedump");
 
-        printf("synthesiaframedump ");
-        printf(__DATE__);
-        printf("\n");
+        printf("synthesiaframedump %s\n", __DATE__);
+        printf("compiled for synthesia %d.%d\n", SYNTHESIA_VER_MAJ, SYNTHESIA_VER_MIN);
 
         printf("***make sure that you're running synthesia in opengl and NOT directx9, or else this won't work!!!***\n");
 
+#ifdef USE_QPC
         printf("getting initial performance counter\n");
         bool qpc_ret = QueryPerformanceCounter(&fake_qpc);
         if (!qpc_ret) {
             printf("failed to get the initial performance counter! getlasterror: 0x%x\n", GetLastError());
             fail();
         }
-
-        /*
-        printf("getting performance counter frequency\n");
-        LARGE_INTEGER pf;
-        bool qpf_ret = QueryPerformanceFrequency(&pf);
-        if (!qpf_ret) {
-            printf("failed to get the performance counter frequency! getlasterror: 0x%x\n", GetLastError());
-            fail();
-        }
-        fake_qpc_interval = pf.QuadPart / 100; // 100 fps, 60 fps will cause a slight desync between video and audio after a while
-        */
+#else
+        printf("getting initial system time\n");
+        fake_tgt = timeGetTime();
+#endif
 
         // synthesia has aslr on
         printf("getting synthesia's base address\n");
@@ -194,7 +225,7 @@ BOOL APIENTRY DllMain( HMODULE hModule,
             fail();
         }
         printf("base_addr: 0x%p\n", base_addr);
-
+#ifdef USE_QPC
         printf("replacing QueryPerformanceCounter call\n");
         BYTE qpc_patch_bytes[] = { 0xFF, 0x15, 0x00, 0x00, 0x00, 0x00 };
         auto custom_qpc_ptr_ptr = &custom_qpc_ptr;
@@ -209,6 +240,14 @@ BOOL APIENTRY DllMain( HMODULE hModule,
         memcpy(&qpf_patch_bytes[2], &custom_qpf_ptr_ptr, 4);
         auto qpf_patch = QPatch((void*)(base_addr + QPF_CALL), (BYTE*)&qpf_patch_bytes, sizeof(qpf_patch_bytes));
         qpf_patch.patch();
+#else
+        printf("replacing timeGetTime call\n");
+        BYTE tgt_patch_bytes[] = { 0xFF, 0x15, 0x00, 0x00, 0x00, 0x00 };
+        auto custom_tgt_ptr_ptr = &custom_tgt_ptr;
+        memcpy(&tgt_patch_bytes[2], &custom_tgt_ptr_ptr, 4);
+        auto tgt_patch = QPatch((void*)(base_addr + TGT_CALL), (BYTE*)&tgt_patch_bytes, sizeof(tgt_patch_bytes));
+        tgt_patch.patch();
+#endif
 
         printf("getting opengl functions\n");
         auto ogl32_handle = GetModuleHandle(L"opengl32.dll");
@@ -228,7 +267,11 @@ BOOL APIENTRY DllMain( HMODULE hModule,
         glswap_patch.patch();
 
         printf("hooking GameState's constructor\n");
+#ifdef STDCALL_GAMESTATE_CTOR
+        gamestate_ctor = (void(__stdcall*)(void*, void*))(base_addr + GAMESTATE_CTOR_PTR);
+#else
         gamestate_ctor = (void(__thiscall*)(void*, DWORD*))(base_addr + GAMESTATE_CTOR_PTR);
+#endif
         MAKE_HOOK(gamestate_ctor);
 
         printf("hooking PlayingState's constructor\n");
